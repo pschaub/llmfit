@@ -49,6 +49,37 @@ Launches the interactive terminal UI. Your system specs (CPU, RAM, GPU name, VRA
 
 ### Vim-like modes
 
+**Mouse:** Click the search and filter boxes and visible hotkey hints to perform
+their corresponding keyboard actions. Click a
+model row to select it; double-click or press Enter to open its details. The wheel
+and scrollbar move the visible model list without changing the selected model.
+The selection may scroll out of view; keyboard navigation reveals it again.
+The model scrollbar supports clicking its arrows or track and dragging its thumb.
+
+Model-column headers sort by their column; clicking the same header again reverses
+the direction. The selected model is preserved and the new order starts at the
+top. Existing installed-first and unrunnable-last grouping policies still apply.
+The search/filter boxes above retain their existing actions. Clicking the selected
+model name in the status bar opens its details, even when its row is off-screen.
+Click download progress to open the download manager, or the SIM badge to edit
+the active hardware simulation.
+
+Checkbox lists support clicking to toggle an option and wheel navigation. Click
+editable fields in the planner, simulation, advanced configuration and range
+filter to focus them. Dialog hints such as Apply, Reset and Close are clickable.
+Download-provider clicks select a provider; Enter/download confirms the action.
+Leaderboard rows, its hardware picker, and download-manager sections and history
+also accept mouse input. A popup captures input without changing the table below.
+Popups also have a clickable `[Esc]` close hint in their top border.
+The detail-view pull hint opens the existing download-provider picker. Leaderboard
+retry, hardware-selection and clear-search notices are clickable, as are the
+navigation hints in inference-benchmark titles. Inference-benchmark rows use the
+same single-click selection and double-click details behavior as model rows.
+Download-manager sections take focus on click or wheel input, not mouse movement;
+click the directory line to edit it. Hardware values, scores, explanatory text,
+URLs and displayed CLI commands remain informational.
+Only visible controls respond; modified clicks and right clicks are ignored.
+
 The TUI uses Vim-inspired modes shown in the bottom-left status bar. The current mode determines which keys are active.
 
 #### Normal mode
