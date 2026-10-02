@@ -260,6 +260,39 @@ fn handle_mouse_at(app: &mut App, mouse: MouseEvent, terminal_area: Rect, now: I
         }
         return false;
     }
+    if click {
+        if crate::tui_ui::status_progress_area(app, layout[3])
+            .is_some_and(|area| area.contains(position))
+        {
+            if !app.show_downloads {
+                // Opening another view leaves the benchmark worker running.
+                app.close_bench();
+                app.toggle_downloads();
+            }
+            return true;
+        }
+        if crate::tui_ui::status_model_area(app, layout[3])
+            .is_some_and(|area| area.contains(position))
+        {
+            match app.input_mode {
+                InputMode::Search => app.exit_search(),
+                InputMode::Visual => app.exit_visual_mode(),
+                InputMode::Select => app.exit_select_mode(),
+                _ => {}
+            }
+            app.toggle_detail();
+            return true;
+        }
+        let system = layout[0].inner(ratatui::layout::Margin::new(1, 1));
+        if app.sim_active
+            && mouse.row == system.y
+            && mouse.column >= system.x
+            && mouse.column < system.x + system.width.min(5)
+        {
+            app.open_simulation_popup();
+            return true;
+        }
+    }
     let top = crate::tui_ui::search_and_filter_layout(layout[1]);
     if click && let Some(index) = top.iter().position(|rect| rect.contains(position)) {
         if app.input_mode == InputMode::Benchmarks {
@@ -305,7 +338,7 @@ fn handle_mouse_at(app: &mut App, mouse: MouseEvent, terminal_area: Rect, now: I
         || app.show_compare
         || app.show_detail
     {
-        return handle_view_mouse(app, mouse, table_area);
+        return handle_view_mouse(app, mouse, table_area, previous_click, now);
     }
     if !matches!(
         app.input_mode,
@@ -387,11 +420,7 @@ fn handle_mouse_at(app: &mut App, mouse: MouseEvent, terminal_area: Rect, now: I
                 return false;
             }
             if app.input_mode == InputMode::Normal
-                && previous_click.is_some_and(|(when, previous_row, column)| {
-                    previous_row == row
-                        && column.abs_diff(mouse.column) <= 1
-                        && now.saturating_duration_since(when) <= Duration::from_millis(500)
-                })
+                && is_double_click(previous_click, now, row, mouse.column)
             {
                 handle_normal_mode(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
                 return true;
@@ -405,6 +434,19 @@ fn handle_mouse_at(app: &mut App, mouse: MouseEvent, terminal_area: Rect, now: I
         _ => return false,
     }
     true
+}
+
+fn is_double_click(
+    previous: Option<(Instant, usize, u16)>,
+    now: Instant,
+    row: usize,
+    column: u16,
+) -> bool {
+    previous.is_some_and(|(when, previous_row, previous_column)| {
+        previous_row == row
+            && previous_column.abs_diff(column) <= 1
+            && now.saturating_duration_since(when) <= Duration::from_millis(500)
+    })
 }
 
 fn scroll_model_table(app: &mut App, table_area: Rect, delta: isize) {
@@ -704,7 +746,13 @@ fn handle_popup_mouse(app: &mut App, mouse: MouseEvent, area: Rect) -> bool {
     true
 }
 
-fn handle_view_mouse(app: &mut App, mouse: MouseEvent, area: Rect) -> bool {
+fn handle_view_mouse(
+    app: &mut App,
+    mouse: MouseEvent,
+    area: Rect,
+    previous_click: Option<(Instant, usize, u16)>,
+    now: Instant,
+) -> bool {
     use crate::tui_app::{DownloadManagerFocus, PlanField};
     let position = Position::new(mouse.column, mouse.row);
     if !area.contains(position) {
@@ -715,6 +763,10 @@ fn handle_view_mouse(app: &mut App, mouse: MouseEvent, area: Rect) -> bool {
         let Some(section) = chunks.iter().position(|r| r.contains(position)) else {
             return false;
         };
+        let click = mouse.kind == MouseEventKind::Down(MouseButton::Left);
+        if !click && wheel_key(mouse.kind).is_none() {
+            return false;
+        }
         app.dm_focus = [
             DownloadManagerFocus::Active,
             DownloadManagerFocus::Config,
@@ -724,10 +776,7 @@ fn handle_view_mouse(app: &mut App, mouse: MouseEvent, area: Rect) -> bool {
             handle_key(app, key);
             return true;
         }
-        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
-            return false;
-        }
-        if section == 1 {
+        if section == 1 && mouse.row == chunks[1].y + 1 {
             handle_key(app, KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
         }
         if section == 2 && mouse.row >= chunks[2].y + 2 {
@@ -740,6 +789,51 @@ fn handle_view_mouse(app: &mut App, mouse: MouseEvent, area: Rect) -> bool {
             }
         }
         return true;
+    }
+    if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+        if app.show_bench
+            && mouse.row == area.y
+            && mouse.column > area.x
+            && mouse.column < area.right().saturating_sub(1)
+        {
+            // Titles use comma-separated hints such as r=routing and Enter/q=close.
+            let title = crate::tui_ui::bench_title(app);
+            let mut start = 0;
+            for group in title.split_inclusive([',', '(']) {
+                let hint = group.trim().trim_end_matches([',', ')']);
+                if hint.contains('=') {
+                    let hint_start = start + group.len() - group.trim_start().len();
+                    let column = usize::from(mouse.column - area.x - 1);
+                    let hint_end = hint_start + hint.len();
+                    if column >= hint_start && column < hint_end {
+                        let text = hint.replace('=', ":");
+                        if let Some(key) = key_hint_at(&text, column - hint_start) {
+                            handle_key(app, key);
+                            return true;
+                        }
+                    }
+                }
+                start += group.len();
+            }
+            return false;
+        }
+        if app.show_detail && crate::tui_ui::detail_pull_at(app, area, position) {
+            // The existing picker still requires an explicit download confirmation.
+            app.start_download();
+            return true;
+        }
+        if app.show_benchmarks
+            && let Some((notice_area, lines, key)) = crate::tui_ui::leaderboard_notice(app, area)
+            && crate::tui_ui::paragraph_action_at(lines, notice_area, position, false)
+        {
+            // A clicked notice acts on the view, not on the search text input.
+            match key {
+                "Esc" => app.bench_search_clear(),
+                "H" => app.open_bench_hw_picker(),
+                _ => app.bench_refresh(),
+            }
+            return true;
+        }
     }
     if let Some(key) = wheel_key(mouse.kind) {
         if app.show_multi_compare {
@@ -801,10 +895,11 @@ fn handle_view_mouse(app: &mut App, mouse: MouseEvent, area: Rect) -> bool {
     {
         let index = usize::from(row - 2);
         if index < app.bench_model_status.len() {
-            if index == app.bench_selected_row {
+            if is_double_click(previous_click, now, index, mouse.column) {
                 handle_key(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
             } else {
                 app.bench_selected_row = index;
+                app.last_model_click = Some((now, index, mouse.column));
             }
             return true;
         }
@@ -2026,12 +2121,15 @@ mod tests {
         for width in [60, 160] {
             let area = Rect::new(0, 0, width, 24);
             let p = rendered_position(&mut app, area, "downloading");
-            assert!(!handle_mouse(
+            assert!(handle_mouse(
                 &mut app,
                 mouse(MouseEventKind::Down(MouseButton::Left), p.x, p.y),
                 area
             ));
+            assert!(app.show_downloads);
             assert_eq!(app.search_query, "needle");
+            app.close_downloads();
+            app.input_mode = InputMode::Search;
         }
         click_label(&mut app, Rect::new(0, 0, 160, 24), "Ctrl-U:clear");
         assert!(app.search_query.is_empty());
@@ -2118,6 +2216,41 @@ mod tests {
         app.show_downloads = true;
         app.input_mode = InputMode::DownloadManager;
         app.dm_focus = DownloadManagerFocus::Config;
+        let config = crate::tui_ui::download_manager_layout(crate::tui_ui::main_layout(area)[2])[1];
+        assert!(!handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Moved, config.x + 2, config.y),
+            area
+        ));
+        assert_eq!(app.dm_focus, DownloadManagerFocus::Config);
+        app.dm_focus = DownloadManagerFocus::History;
+        assert!(!handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Moved, config.x + 2, config.y),
+            area
+        ));
+        assert_eq!(app.dm_focus, DownloadManagerFocus::History);
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                config.x + 2,
+                config.y,
+            ),
+            area,
+        );
+        assert_eq!(app.dm_focus, DownloadManagerFocus::Config);
+        assert!(!app.dm_editing_dir, "section border only focuses");
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                config.x + 2,
+                config.y + 1,
+            ),
+            area,
+        );
+        assert!(app.dm_editing_dir);
         app.dm_editing_dir = true;
         app.dm_dir_input = "example".to_string();
         app.dm_dir_cursor = 7;
@@ -2142,6 +2275,238 @@ mod tests {
         // Never confirm a run/share in tests: that starts external work.
         click_label(&mut app, area, "[Esc] Skip");
         assert_ne!(app.input_mode, InputMode::BenchOffer);
+    }
+
+    #[test]
+    fn mouse_status_shortcuts_and_simulation_respect_popups() {
+        let area = Rect::new(0, 0, 160, 30);
+        let mut app = plan_mode_app();
+        app.show_plan = false;
+        app.input_mode = InputMode::Normal;
+        let footer = crate::tui_ui::main_layout(area)[3];
+        app.table_follow_selection = false;
+        *app.table_state.offset_mut() = 10;
+        let click = mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            footer.x + 5,
+            footer.y,
+        );
+        assert!(handle_mouse(&mut app, click, area));
+        assert!(app.show_detail);
+        app.show_detail = false;
+        app.open_help_popup();
+        assert!(!handle_mouse(&mut app, click, area));
+        assert!(!app.show_detail);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.sim_active = true;
+        click_label(&mut app, area, "SIM");
+        assert_eq!(app.input_mode, InputMode::Simulation);
+        click_label(&mut app, area, "Esc:close");
+        app.show_plan = true;
+        app.input_mode = InputMode::Plan;
+        click_label(&mut app, area, "SIM");
+        click_label(&mut app, area, "Esc:close");
+        assert_eq!(app.input_mode, InputMode::Plan);
+        app.show_plan = false;
+        app.show_benchmarks = true;
+        app.input_mode = InputMode::Benchmarks;
+        app.bench_loading = false;
+        click_label(&mut app, area, "SIM");
+        click_label(&mut app, area, "Esc:close");
+        assert_eq!(app.input_mode, InputMode::Benchmarks);
+        app.show_benchmarks = false;
+        app.input_mode = InputMode::Normal;
+        app.pull_status = Some("Marked for compare".to_string());
+        let p = rendered_position(&mut app, area, "Marked");
+        assert!(!handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), p.x, p.y),
+            area
+        ));
+        assert!(
+            !app.show_downloads,
+            "informational status is not a download control"
+        );
+    }
+
+    #[test]
+    fn mouse_detail_download_hint_follows_wrapping_without_starting_a_download() {
+        let mut app = plan_mode_app();
+        app.show_plan = false;
+        app.input_mode = InputMode::Normal;
+        let index = app
+            .all_fits
+            .iter()
+            .position(|fit| !fit.model.gguf_sources.is_empty())
+            .expect("GGUF model");
+        app.filtered_fits = vec![index];
+        app.selected_row = 0;
+        app.all_fits[index].installed = false;
+        // A long Unicode name changes the hint's wrapped screen position.
+        app.all_fits[index].model.name =
+            "測試 / A long model name for wrapped metadata".to_string();
+        app.llamacpp_available = true;
+        app.show_detail = true;
+        for width in [80, 160] {
+            let area = Rect::new(0, 0, width, 60);
+            let p = rendered_position(&mut app, area, "press d");
+            let table = crate::tui_ui::main_layout(area)[2];
+            assert!(crate::tui_ui::detail_pull_at(&app, table, p));
+            let text = rendered_position(&mut app, area, "Installed:");
+            assert!(!handle_mouse(
+                &mut app,
+                mouse(MouseEventKind::Down(MouseButton::Left), text.x, text.y),
+                area
+            ));
+            assert!(handle_mouse(
+                &mut app,
+                mouse(MouseEventKind::Down(MouseButton::Left), p.x, p.y),
+                area
+            ));
+            assert_eq!(app.input_mode, InputMode::DownloadProviderPopup);
+            assert!(
+                app.pull_active.is_none(),
+                "click opens the picker; no download starts"
+            );
+            app.close_download_provider_popup();
+        }
+        app.llamacpp_available = false;
+        let area = Rect::new(0, 0, 160, 60);
+        let p = rendered_position(&mut app, area, "No runtime detected");
+        assert!(!handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), p.x, p.y),
+            area
+        ));
+    }
+
+    #[test]
+    fn mouse_live_benchmark_uses_double_click_and_title_actions() {
+        use crate::tui_app::{BenchModelState, BenchModelStatus, BenchViewMode};
+        let mut app = plan_mode_app();
+        app.show_plan = false;
+        app.input_mode = InputMode::Normal;
+        app.show_bench = true;
+        app.bench_model_status = vec![BenchModelStatus {
+            name: "test model".to_string(),
+            state: BenchModelState::Complete,
+            roles_done: 0,
+            roles_total: 0,
+            current_role: String::new(),
+            last_quality: 0.0,
+            last_speed: 0.0,
+        }];
+        let area = Rect::new(0, 0, 160, 30);
+        let p = rendered_position(&mut app, area, "test model");
+        let click = mouse(MouseEventKind::Down(MouseButton::Left), p.x, p.y);
+        let now = Instant::now();
+        assert!(handle_mouse_at(&mut app, click, area, now));
+        assert!(!app.bench_show_detail);
+        assert!(handle_mouse_at(
+            &mut app,
+            click,
+            area,
+            now + Duration::from_millis(700)
+        ));
+        assert!(!app.bench_show_detail);
+        assert!(handle_mouse_at(
+            &mut app,
+            click,
+            area,
+            now + Duration::from_millis(900)
+        ));
+        assert!(app.bench_show_detail);
+        let y = crate::tui_ui::main_layout(area)[2].y;
+        let p = rendered_position_in(&mut app, area, "Enter/q=close detail", y..y + 1);
+        assert!(handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), p.x, p.y),
+            area
+        ));
+        assert!(!app.bench_show_detail);
+        let p = rendered_position_in(&mut app, area, "r=routing", y..y + 1);
+        assert!(handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), p.x, p.y),
+            area
+        ));
+        assert_eq!(app.bench_view_mode, BenchViewMode::Routing);
+        let p = rendered_position_in(&mut app, area, "r=results", y..y + 1);
+        assert!(handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), p.x, p.y),
+            area
+        ));
+        assert_eq!(app.bench_view_mode, BenchViewMode::Results);
+        let y = crate::tui_ui::main_layout(area)[2].y;
+        let p = rendered_position_in(&mut app, area, "Quality", y..y + 1);
+        assert!(!handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), p.x, p.y),
+            area
+        ));
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn mouse_leaderboard_notices_only_activate_the_visible_action() {
+        let area = Rect::new(0, 0, 100, 30);
+        let mut app = plan_mode_app();
+        app.show_plan = false;
+        app.show_benchmarks = true;
+        app.input_mode = InputMode::Benchmarks;
+        app.bench_loading = false;
+        app.bench_entries.clear();
+        click_label(&mut app, area, "H:pick");
+        assert!(app.bench_hw_picker_open);
+        click_label(&mut app, area, "[Esc]");
+        assert!(!app.bench_hw_picker_open);
+        app.bench_error = Some("Example error".to_string());
+        let p = rendered_position(&mut app, area, "r:retry");
+        let table = crate::tui_ui::main_layout(area)[2];
+        let (notice_area, lines, key) =
+            crate::tui_ui::leaderboard_notice(&app, table).expect("error notice");
+        assert_eq!(key, "r");
+        // Check retry hit geometry without starting a network fetch in the test.
+        assert!(crate::tui_ui::paragraph_action_at(
+            lines,
+            notice_area,
+            p,
+            false
+        ));
+        let p = rendered_position(&mut app, area, "LOCALMAXXING");
+        assert!(!handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), p.x, p.y),
+            area
+        ));
+        assert!(!app.bench_loading);
+        app.open_bench_hw_picker();
+        click_label(&mut app, area, "[Esc]");
+        assert!(
+            !app.bench_hw_picker_open,
+            "picker must also render above error notices"
+        );
+        app.bench_error = None;
+        app.bench_loading = true;
+        app.open_bench_hw_picker();
+        click_label(&mut app, area, "[Esc]");
+        assert!(
+            !app.bench_hw_picker_open,
+            "picker must remain usable while loading"
+        );
+        app.bench_loading = false;
+        app.bench_entries = vec![
+            serde_json::from_value(serde_json::json!({
+                "id": "test", "model": {"hf_id": "test/model"}
+            }))
+            .expect("leaderboard fixture"),
+        ];
+        app.bench_search_query = "no match".to_string();
+        app.bench_search_active = true;
+        click_label(&mut app, area, "Esc:clear the search");
+        assert!(app.bench_search_query.is_empty());
+        assert!(!app.bench_search_active);
     }
 
     #[test]
@@ -2189,6 +2554,15 @@ mod tests {
         update_model_viewport(&mut app, resized);
         assert_eq!(app.table_state.offset(), 0);
         assert_eq!(app.table_state.selected(), None);
+        terminal
+            .draw(|f| crate::tui_ui::draw(f, &mut app))
+            .expect("empty table");
+        let footer = crate::tui_ui::main_layout(resized)[3];
+        let text = (0..resized.width)
+            .map(|x| terminal.backend().buffer()[(x, footer.y)].symbol())
+            .collect::<String>();
+        assert!(text.contains("No model selected"));
+        assert!(crate::tui_ui::status_model_area(&app, footer).is_none());
     }
 
     #[test]

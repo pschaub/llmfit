@@ -1913,21 +1913,8 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
-fn draw_detail(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
-    let fit = match app.selected_fit() {
-        Some(f) => f,
-        None => {
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .title(" No model selected ");
-            frame.render_widget(block, area);
-            return;
-        }
-    };
-
-    let color = fit_color(fit.fit_level, tc);
-
-    let mut lines = vec![
+fn detail_metadata_lines<'a>(app: &'a App, fit: &'a ModelFit, tc: &ThemeColors) -> Vec<Line<'a>> {
+    vec![
         Line::from(""),
         Line::from(vec![
             Span::styled("  Model:       ", Style::default().fg(tc.muted)),
@@ -2018,32 +2005,103 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
                 Style::default().fg(tc.muted),
             ),
         ]),
-        Line::from(vec![
-            Span::styled("  Installed:   ", Style::default().fg(tc.muted)),
-            {
-                let installed_providers = app.installed.installed_providers(&fit.model);
-                let any_available = app.ollama_available
-                    || app.mlx_available
-                    || app.llamacpp_available
-                    || app.docker_mr_available
-                    || app.lmstudio_available
-                    || app.vllm_available;
+        Line::from({
+            let mut spans = vec![Span::styled(
+                "  Installed:   ",
+                Style::default().fg(tc.muted),
+            )];
+            let installed_providers = app.installed.installed_providers(&fit.model);
+            let any_available = app.ollama_available
+                || app.mlx_available
+                || app.llamacpp_available
+                || app.docker_mr_available
+                || app.lmstudio_available
+                || app.vllm_available;
 
-                if !installed_providers.is_empty() {
-                    let label = installed_providers
-                        .iter()
-                        .map(|p| format!("✓ {p}"))
-                        .collect::<Vec<_>>()
-                        .join("  ");
-                    Span::styled(label, Style::default().fg(tc.good).bold())
-                } else if any_available {
-                    Span::styled("✗ No  (press d to pull)", Style::default().fg(tc.muted))
-                } else {
-                    Span::styled("- No runtime detected", Style::default().fg(tc.muted))
-                }
-            },
-        ]),
-    ];
+            if !installed_providers.is_empty() {
+                let label = installed_providers
+                    .iter()
+                    .map(|p| format!("✓ {p}"))
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                spans.push(Span::styled(label, Style::default().fg(tc.good).bold()));
+            } else if any_available {
+                spans.push(Span::styled("✗ No  ", Style::default().fg(tc.muted)));
+                spans.push(Span::styled(
+                    "(press d to pull)",
+                    Style::default().fg(tc.accent).underlined(),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    "- No runtime detected",
+                    Style::default().fg(tc.muted),
+                ));
+            }
+            spans
+        }),
+    ]
+}
+
+/// Use the same paragraph wrapping as drawing; only underlined action spans hit.
+pub(crate) fn paragraph_action_at(
+    lines: Vec<Line<'_>>,
+    area: Rect,
+    position: ratatui::layout::Position,
+    wrap: bool,
+) -> bool {
+    use ratatui::{buffer::Buffer, widgets::Widget};
+    if !area.contains(position) {
+        return false;
+    }
+    let mut buffer = Buffer::empty(area);
+    let paragraph = Paragraph::new(lines);
+    if wrap {
+        paragraph
+            .wrap(Wrap { trim: false })
+            .render(area, &mut buffer);
+    } else {
+        paragraph.render(area, &mut buffer);
+    }
+    let cell = &buffer[(position.x, position.y)];
+    cell.modifier.contains(Modifier::UNDERLINED) && !cell.symbol().trim().is_empty()
+}
+
+pub(crate) fn detail_pull_at(app: &App, area: Rect, position: ratatui::layout::Position) -> bool {
+    let Some(fit) = app.selected_fit() else {
+        return false;
+    };
+    let left = detail_layout(fit, area)[0].inner(Margin::new(1, 1));
+    paragraph_action_at(
+        detail_metadata_lines(app, fit, &app.theme.colors()),
+        left,
+        position,
+        true,
+    )
+}
+
+fn detail_layout(fit: &ModelFit, area: Rect) -> [Rect; 2] {
+    if !fit.model.gguf_sources.is_empty() || !fit.notes.is_empty() || fit.fits_with_turboquant {
+        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area)
+    } else {
+        [area, Rect::default()]
+    }
+}
+
+fn draw_detail(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
+    let fit = match app.selected_fit() {
+        Some(f) => f,
+        None => {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(" No model selected ");
+            frame.render_widget(block, area);
+            return;
+        }
+    };
+
+    let color = fit_color(fit.fit_level, tc);
+
+    let mut lines = detail_metadata_lines(app, fit, tc);
 
     // Scoring section
     let score_color = if fit.score >= 70.0 {
@@ -2432,10 +2490,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
 
     if has_right_pane {
         // Split into left (model info) and right (downloads + notes) panes
-        let h_layout = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-            .split(area);
+        let h_layout = detail_layout(fit, area);
 
         left_area = h_layout[0];
 
@@ -3312,17 +3367,52 @@ pub(crate) fn status_progress_text(app: &App) -> Option<String> {
         })
 }
 
-pub(crate) fn status_key_area(app: &App, area: Rect) -> Rect {
-    let rows: [Rect; 2] =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
-    let mut keys = rows[1];
+fn status_shows_model(app: &App) -> bool {
+    !(app.show_detail
+        || app.show_compare
+        || app.show_multi_compare
+        || app.show_plan
+        || app.show_downloads
+        || app.show_benchmarks
+        || app.show_bench)
+}
+
+pub(crate) fn status_model_area(app: &App, area: Rect) -> Option<Rect> {
+    if !status_shows_model(app) {
+        return None;
+    }
+    let fit = app.selected_fit()?;
+    let row = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas::<2>(area)[0];
+    Some(Rect::new(
+        row.x,
+        row.y,
+        row.width
+            .min(3 + UnicodeWidthStr::width(fit.model.name.as_str()) as u16),
+        row.height,
+    ))
+}
+
+fn status_footer_areas(app: &App, area: Rect) -> [Rect; 2] {
+    let footer =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas::<2>(area)[1];
     if let Some(text) = status_progress_text(app) {
-        keys = Layout::horizontal([
+        Layout::horizontal([
             Constraint::Min(20),
             Constraint::Length(text.len() as u16 + 2),
         ])
-        .areas::<2>(keys)[0];
+        .areas(footer)
+    } else {
+        [footer, Rect::default()]
     }
+}
+
+pub(crate) fn status_progress_area(app: &App, area: Rect) -> Option<Rect> {
+    (app.pull_active.is_some() || app.pull_percent.is_some())
+        .then(|| status_footer_areas(app, area)[1])
+}
+
+pub(crate) fn status_key_area(app: &App, area: Rect) -> Rect {
+    let keys = status_footer_areas(app, area)[0];
     let prefix = UnicodeWidthStr::width(status_keys_and_mode(app).1.as_str()) as u16 + 2;
     let skip = prefix.min(keys.width);
     Rect::new(keys.x + skip, keys.y, keys.width - skip, keys.height)
@@ -3338,13 +3428,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         .split(area);
 
     // Row 0: selected model full name
-    let model_line = if !app.show_detail
-        && !app.show_compare
-        && !app.show_multi_compare
-        && !app.show_plan
-        && !app.show_downloads
-        && !app.show_benchmarks
-    {
+    let model_line = if status_shows_model(app) {
         if let Some(&idx) = app.filtered_fits.get(app.selected_row) {
             let fit = &app.all_fits[idx];
             Line::from(vec![
@@ -3371,13 +3455,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
 
     // Row 1: keybindings (with download progress if active)
     if let Some(progress_text) = status_progress_text(app) {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Min(20),
-                Constraint::Length(progress_text.len() as u16 + 2),
-            ])
-            .split(rows[1]);
+        let chunks = status_footer_areas(app, area);
 
         let status_line = Line::from(vec![
             Span::styled(
@@ -4573,6 +4651,75 @@ fn format_epoch(epoch: u64) -> String {
     format!("{:04}-{:02}-{:02}", y, m + 1, remaining + 1)
 }
 
+pub(crate) fn leaderboard_notice(
+    app: &App,
+    area: Rect,
+) -> Option<(Rect, Vec<Line<'_>>, &'static str)> {
+    if app.bench_loading {
+        return None;
+    }
+    let inner = area.inner(Margin::new(1, 1));
+    let tc = app.theme.colors();
+    let action = Style::default().fg(tc.accent).underlined();
+    if let Some(err) = &app.bench_error
+        && app.bench_entries.is_empty()
+    {
+        return Some((
+            inner,
+            vec![
+                Line::from(Span::styled(
+                    "  Failed to fetch benchmarks:",
+                    Style::default().fg(tc.error),
+                )),
+                Line::from(Span::styled(
+                    format!("  {}", err),
+                    Style::default().fg(tc.muted),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  r:retry", action),
+                    Span::styled(
+                        ", or set LOCALMAXXING_API_KEY env var",
+                        Style::default().fg(tc.muted),
+                    ),
+                ]),
+            ],
+            "r",
+        ));
+    }
+    if app.bench_entries.is_empty() {
+        return Some((
+            inner,
+            vec![
+                Line::from(Span::styled(
+                    "  No benchmark results found for this hardware configuration.",
+                    Style::default().fg(tc.muted),
+                )),
+                Line::from(""),
+                Line::from(Span::styled("  H:pick a different GPU/chip", action)),
+            ],
+            "H",
+        ));
+    }
+    if app.bench_visible_indices().is_empty() && !app.bench_search_query.is_empty() {
+        let content =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).areas::<2>(inner)[1];
+        return Some((
+            content,
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("  No results match /{}", app.bench_search_query),
+                    Style::default().fg(tc.muted),
+                )),
+                Line::from(Span::styled("  Esc:clear the search", action)),
+            ],
+            "Esc",
+        ));
+    }
+    None
+}
+
 fn draw_benchmarks(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -4589,46 +4736,16 @@ fn draw_benchmarks(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColor
             Style::default().fg(tc.warning),
         )));
         frame.render_widget(loading, inner);
+        if app.bench_hw_picker_open {
+            draw_bench_hw_picker(frame, app, tc);
+        }
         return;
     }
 
-    // Full-page error only when there is nothing to show — cached data and
-    // locally stored results still render, with the error in the summary line.
-    if let Some(ref err) = app.bench_error
-        && app.bench_entries.is_empty()
+    if let Some((notice_area, lines, _)) = leaderboard_notice(app, area)
+        && notice_area.y == inner.y
     {
-        let err_text = Paragraph::new(vec![
-            Line::from(Span::styled(
-                "  Failed to fetch benchmarks:",
-                Style::default().fg(tc.error),
-            )),
-            Line::from(Span::styled(
-                format!("  {}", err),
-                Style::default().fg(tc.muted),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Press r to retry, or set LOCALMAXXING_API_KEY env var",
-                Style::default().fg(tc.muted),
-            )),
-        ]);
-        frame.render_widget(err_text, inner);
-        return;
-    }
-
-    if app.bench_entries.is_empty() && !app.bench_hw_picker_open {
-        let empty = Paragraph::new(vec![
-            Line::from(Span::styled(
-                "  No benchmark results found for this hardware configuration.",
-                Style::default().fg(tc.muted),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Press H to pick a different GPU/chip",
-                Style::default().fg(tc.muted),
-            )),
-        ]);
-        frame.render_widget(empty, inner);
+        frame.render_widget(Paragraph::new(lines), notice_area);
         if app.bench_hw_picker_open {
             draw_bench_hw_picker(frame, app, tc);
         }
@@ -4822,19 +4939,8 @@ fn draw_benchmarks(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColor
         .split(inner);
 
     frame.render_widget(Paragraph::new(summary), chunks[0]);
-    if visible.is_empty() && !app.bench_search_query.is_empty() {
-        let no_match = Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                format!("  No results match /{}", app.bench_search_query),
-                Style::default().fg(tc.muted),
-            )),
-            Line::from(Span::styled(
-                "  Esc to clear the search",
-                Style::default().fg(tc.muted),
-            )),
-        ]);
-        frame.render_widget(no_match, chunks[1]);
+    if let Some((notice_area, lines, _)) = leaderboard_notice(app, area) {
+        frame.render_widget(Paragraph::new(lines), notice_area);
     } else {
         frame.render_widget(table, chunks[1]);
     }
@@ -5173,8 +5279,8 @@ fn bench_get_role_quality(
         .map(|rs| rs.quality)
 }
 
-fn draw_bench(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
-    let title = match app.bench_view_mode {
+pub(crate) fn bench_title(app: &App) -> &'static str {
+    match app.bench_view_mode {
         BenchViewMode::Results => {
             if app.bench_show_detail {
                 " INFERENCE BENCH: Quality Benchmarks (j/k=scroll, Enter/q=close detail) "
@@ -5183,7 +5289,11 @@ fn draw_bench(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
             }
         }
         BenchViewMode::Routing => " INFERENCE BENCH: Routing Matrix (r=results, q=back) ",
-    };
+    }
+}
+
+fn draw_bench(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
+    let title = bench_title(app);
 
     let block = Block::default()
         .borders(Borders::ALL)

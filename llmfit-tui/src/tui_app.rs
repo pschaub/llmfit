@@ -3797,7 +3797,15 @@ impl App {
     }
 
     pub fn close_simulation_popup(&mut self) {
-        self.input_mode = InputMode::Normal;
+        self.input_mode = if self.show_benchmarks {
+            InputMode::Benchmarks
+        } else if self.show_downloads {
+            InputMode::DownloadManager
+        } else if self.show_plan {
+            InputMode::Plan
+        } else {
+            InputMode::Normal
+        };
     }
 
     pub fn apply_simulation(&mut self) {
@@ -3823,7 +3831,7 @@ impl App {
         self.specs = specs;
         self.sim_active = true;
         self.rebuild_fits();
-        self.input_mode = InputMode::Normal;
+        self.close_simulation_popup();
     }
 
     pub fn reset_simulation(&mut self) {
