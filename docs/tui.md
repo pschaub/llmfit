@@ -49,11 +49,17 @@ Launches the interactive terminal UI. Your system specs (CPU, RAM, GPU name, VRA
 
 ### Vim-like modes
 
-**Mouse:** Click the search and filter boxes, actionable model-column headers,
-and visible hotkey hints to perform the corresponding keyboard action. Click a
-model row to select it; clicking the selected row opens its details. Use the wheel
-to navigate the hovered list or view. The model scrollbar supports clicking its
-arrows or track and dragging its thumb.
+**Mouse:** Click the search and filter boxes and visible hotkey hints to perform
+their corresponding keyboard actions. Click a
+model row to select it; double-click or press Enter to open its details. The wheel
+and scrollbar move the visible model list without changing the selected model.
+The selection may scroll out of view; keyboard navigation reveals it again.
+The model scrollbar supports clicking its arrows or track and dragging its thumb.
+
+Model-column headers sort by their column; clicking the same header again reverses
+the direction. The selected model is preserved and the new order starts at the
+top. Existing installed-first and unrunnable-last grouping policies still apply.
+The search/filter boxes above retain their existing actions.
 
 Checkbox lists support clicking to toggle an option and wheel navigation. Click
 editable fields in the planner, simulation, advanced configuration and range

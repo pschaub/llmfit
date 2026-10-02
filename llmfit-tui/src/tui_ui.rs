@@ -17,7 +17,7 @@ use crate::tui_app::{
     DownloadProvider, FitFilter, InputMode, PlanField, SimulationField, matched_gguf_provider,
     provider_selected,
 };
-use llmfit_core::fit::{FitLevel, ModelFit, SortColumn};
+use llmfit_core::fit::{FitLevel, ModelFit};
 use llmfit_core::hardware::is_running_in_wsl;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -701,8 +701,12 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
     let sort_text = Paragraph::new(Line::from(Span::styled(
         format!(
             " {} {}",
-            app.sort_column.label(),
-            if app.sort_ascending { "↑" } else { "↓" }
+            app.table_sort_label(),
+            if app.table_sort_is_ascending() {
+                "↑"
+            } else {
+                "↓"
+            }
         ),
         Style::default().fg(tc.accent),
     )))
@@ -926,13 +930,10 @@ const MODEL_TABLE_WIDTHS: [Constraint; 15] = [
 ];
 
 /// Match Table's border, highlight symbol, and default column spacing.
-pub(crate) fn model_table_columns(area: Rect, has_selection: bool) -> [Rect; 15] {
+pub(crate) fn model_table_columns(area: Rect) -> [Rect; 15] {
     let inner = area.inner(Margin::new(1, 1));
-    let [_, columns] = Layout::horizontal([
-        Constraint::Length(if has_selection { 2 } else { 0 }),
-        Constraint::Fill(0),
-    ])
-    .areas(Rect::new(0, 0, inner.width, 1));
+    let [_, columns] = Layout::horizontal([Constraint::Length(2), Constraint::Fill(0)])
+        .areas(Rect::new(0, 0, inner.width, 1));
     // Table solves column constraints at the origin before translating them.
     // Match that exactly, including rounding in narrow terminals.
     let columns: [Rect; 15] = Layout::horizontal(MODEL_TABLE_WIDTHS)
@@ -949,9 +950,14 @@ pub(crate) fn model_table_viewport(
     selected: usize,
     offset: usize,
     capacity: usize,
+    follow_selection: bool,
 ) -> std::ops::Range<usize> {
     if len == 0 {
         return 0..0;
+    }
+    if !follow_selection {
+        let start = offset.min(len.saturating_sub(capacity.max(1)));
+        return start..start.saturating_add(capacity).min(len);
     }
     let selected = selected.min(len - 1);
     let mut start = offset.min(len - 1).min(selected);
@@ -965,21 +971,11 @@ pub(crate) fn model_table_viewport(
 }
 
 fn draw_table(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
-    let sort_col = app.sort_column;
     let header_names = [
         "", "Inst", "Model", "Provider", "Params", "Score", "tok/s*", "Quant", "Disk", "Mode",
         "Mem %", "Ctx", "Date", "Fit", "Use Case",
     ];
-    let sort_col_idx: Option<usize> = match sort_col {
-        SortColumn::Score => Some(5),
-        SortColumn::Tps => Some(6),
-        SortColumn::Params => Some(4),
-        SortColumn::MemPct => Some(10),
-        SortColumn::Ctx => Some(11),
-        SortColumn::ReleaseDate => Some(12),
-        SortColumn::UseCase => Some(14),
-        SortColumn::Provider => Some(3),
-    };
+    let sort_col_idx = app.sorted_table_column();
     let in_select_mode = app.input_mode == InputMode::Select;
     let header_cells = header_names.iter().enumerate().map(|(i, h)| {
         if in_select_mode && app.select_column == i {
@@ -989,9 +985,13 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
                     .bg(tc.accent_secondary)
                     .add_modifier(Modifier::BOLD),
             )
-        } else if sort_col_idx == Some(i) {
-            let arrow = if app.sort_ascending { "▲" } else { "▼" };
-            Cell::from(format!("{} {}", h, arrow)).style(
+        } else if sort_col_idx == i {
+            let arrow = if app.table_sort_is_ascending() {
+                "▲"
+            } else {
+                "▼"
+            };
+            Cell::from(format!("{}{}", h, arrow)).style(
                 Style::default()
                     .fg(tc.accent_secondary)
                     .add_modifier(Modifier::BOLD),
@@ -1009,8 +1009,9 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         app.selected_row,
         app.table_state.offset(),
         usize::from(area.height.saturating_sub(3)),
+        app.table_follow_selection,
     );
-    let columns = model_table_columns(area, viewport.contains(&app.selected_row));
+    let columns = model_table_columns(area);
     let model_col_chars = usize::from(columns[2].width.saturating_sub(1));
     let rows: Vec<Row> = app.filtered_fits[viewport.clone()]
         .iter()
@@ -1193,7 +1194,8 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
                 .bg(tc.highlight_bg)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶ ");
+        .highlight_symbol("▶ ")
+        .highlight_spacing(ratatui::widgets::HighlightSpacing::Always);
 
     // Widget selection is local to this frame. Persistent navigation state is
     // updated by tui_events, never by drawing the table.
@@ -1237,7 +1239,9 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     // Scrollbar
     if app.filtered_fits.len() > (area.height as usize).saturating_sub(3) {
         let mut scrollbar_state =
-            ScrollbarState::new(app.filtered_fits.len()).position(app.selected_row);
+            ScrollbarState::new(app.filtered_fits.len().saturating_sub(viewport.len()) + 1)
+                .position(viewport.start)
+                .viewport_content_length(viewport.len());
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(Some("↑"))
@@ -3797,8 +3801,9 @@ fn draw_help_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     // Entries: ("key", "description") — empty key = blank line, key without leading spaces = section header
     let help_entries: Vec<(&str, &str)> = vec![
         ("Navigation", ""),
-        ("  Mouse wheel", "Scroll the hovered list / view"),
+        ("  Mouse wheel", "Scroll list (keep selection)"),
         ("  Left click", "Controls, hotkeys, rows and fields"),
+        ("  Double click", "Open model details"),
         ("  ↑ / k", "Move up"),
         ("  ↓ / j", "Move down"),
         ("  Enter", "Toggle detail view"),
@@ -5032,7 +5037,7 @@ fn draw_filter_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     )));
 
     let is_sort = app.filter_field == FilterPopupField::SortDirection;
-    let dir_text = if app.filter_sort_ascending {
+    let dir_text = if app.table_sort_direction_is_ascending(app.filter_sort_ascending) {
         "Ascending ↑"
     } else {
         "Descending ↓"
@@ -5851,7 +5856,7 @@ mod tests {
         ] {
             let mut full = Terminal::new(TestBackend::new(30, height)).expect("full table");
             let mut window = Terminal::new(TestBackend::new(30, height)).expect("window table");
-            let range = model_table_viewport(len, selected, offset, usize::from(height - 3));
+            let range = model_table_viewport(len, selected, offset, usize::from(height - 3), true);
             let make_table = |range: std::ops::Range<usize>| {
                 Table::new(
                     range.map(|i| Row::new([format!("Model {i}")])),
@@ -5884,9 +5889,9 @@ mod tests {
 
     #[test]
     fn model_viewport_handles_no_room_for_rows() {
-        assert_eq!(model_table_viewport(0, 0, 0, 0), 0..0);
-        assert_eq!(model_table_viewport(100, 50, 40, 0), 40..40);
-        assert_eq!(model_table_viewport(3, 99, 99, 1), 2..3);
+        assert_eq!(model_table_viewport(0, 0, 0, 0, true), 0..0);
+        assert_eq!(model_table_viewport(100, 50, 40, 0, true), 40..40);
+        assert_eq!(model_table_viewport(3, 99, 99, 1, true), 2..3);
     }
 
     #[test]
