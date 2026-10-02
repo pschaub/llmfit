@@ -24,6 +24,90 @@ use unicode_width::UnicodeWidthStr;
 
 const DM_MODELS_DIR_LABEL: &str = "  Models dir:  ";
 
+pub(crate) fn centered_popup(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width.saturating_sub(4));
+    let height = height.min(area.height.saturating_sub(4));
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+/// Popup bounds, list length and cursor, shared with mouse hit testing.
+pub(crate) fn selection_popup(
+    app: &App,
+    mode: InputMode,
+    area: Rect,
+) -> Option<(Rect, usize, usize)> {
+    let (width, count, cursor) = match mode {
+        InputMode::ProviderPopup => {
+            let count = app.provider_filtered_indices().len();
+            let width = app.providers.iter().map(|s| s.len()).max().unwrap_or(10) + 10;
+            let height = (count.max(1) as u16).min(area.height.saturating_sub(6)) + 3;
+            return Some((
+                centered_popup(area, (width as u16).max(28), height),
+                count,
+                app.provider_cursor,
+            ));
+        }
+        InputMode::UseCasePopup => (
+            app.use_cases
+                .iter()
+                .map(|v| v.label().len())
+                .max()
+                .unwrap_or(10),
+            app.use_cases.len(),
+            app.use_case_cursor,
+        ),
+        InputMode::CapabilityPopup => (
+            app.capabilities
+                .iter()
+                .map(|v| v.label().len())
+                .max()
+                .unwrap_or(10),
+            app.capabilities.len(),
+            app.capability_cursor,
+        ),
+        InputMode::QuantPopup => (
+            app.quants.iter().map(|v| v.len()).max().unwrap_or(10),
+            app.quants.len(),
+            app.quant_cursor,
+        ),
+        InputMode::RunModePopup => (
+            app.run_modes.iter().map(|v| v.len()).max().unwrap_or(10),
+            app.run_modes.len(),
+            app.run_mode_cursor,
+        ),
+        InputMode::ParamsBucketPopup => (
+            app.params_buckets
+                .iter()
+                .map(|v| v.len())
+                .max()
+                .unwrap_or(10),
+            app.params_buckets.len(),
+            app.params_bucket_cursor,
+        ),
+        InputMode::LicensePopup => (
+            app.licenses.iter().map(|v| v.len()).max().unwrap_or(10),
+            app.licenses.len(),
+            app.license_cursor,
+        ),
+        InputMode::RuntimePopup => (
+            app.runtimes.iter().map(|v| v.len()).max().unwrap_or(10),
+            app.runtimes.len(),
+            app.runtime_cursor,
+        ),
+        _ => return None,
+    };
+    Some((
+        centered_popup(area, width as u16 + 10, count as u16 + 2),
+        count,
+        cursor,
+    ))
+}
+
 /// Shared geometry for drawing and event-driven viewport updates.
 pub(crate) fn main_layout(area: Rect) -> [Rect; 4] {
     Layout::default()
@@ -404,6 +488,22 @@ fn visible_dm_dir_input(input: &str, cursor: usize, inner_width: u16) -> (String
     visible_search_query(input, cursor, input_width)
 }
 
+pub(crate) fn search_cursor_at(query: &str, cursor: usize, width: usize, column: usize) -> usize {
+    let (visible, offset) = visible_search_query(query, cursor, width);
+    let byte_at = |cell: usize| {
+        let mut cells = 0;
+        for (byte, grapheme) in visible.grapheme_indices(true) {
+            cells += UnicodeWidthStr::width(grapheme);
+            if cells > cell {
+                return byte;
+            }
+        }
+        visible.len()
+    };
+    let start = floor_grapheme_boundary(query, cursor).saturating_sub(byte_at(usize::from(offset)));
+    start + byte_at(column)
+}
+
 fn floor_grapheme_boundary(value: &str, index: usize) -> usize {
     let mut index = index.min(value.len());
     while index > 0 && !value.is_char_boundary(index) {
@@ -422,8 +522,8 @@ fn floor_grapheme_boundary(value: &str, index: usize) -> usize {
     index
 }
 
-fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
-    let chunks = Layout::default()
+pub(crate) fn search_and_filter_layout(area: Rect) -> [Rect; 9] {
+    Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Min(30),    // search
@@ -436,7 +536,11 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
             Constraint::Length(14), // TP filter
             Constraint::Length(16), // theme
         ])
-        .split(area);
+        .areas(area)
+}
+
+fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
+    let chunks = search_and_filter_layout(area);
 
     // Search box — in the leaderboard view it shows the `/` benchmark search
     let bench_search = app.input_mode == InputMode::Benchmarks
@@ -624,7 +728,7 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
     let fit_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(tc.border))
-        .title(" Fit [f] Filter [F] ")
+        .title(" Fit[f] Filter[F] ")
         .title_style(Style::default().fg(tc.muted));
 
     // Fit level label, then any active range filters spelled out (e.g.
@@ -828,11 +932,14 @@ pub(crate) fn model_table_columns(area: Rect, has_selection: bool) -> [Rect; 15]
         Constraint::Length(if has_selection { 2 } else { 0 }),
         Constraint::Fill(0),
     ])
-    .areas(Rect::new(inner.x, inner.y, inner.width, 1));
-    Layout::horizontal(MODEL_TABLE_WIDTHS)
+    .areas(Rect::new(0, 0, inner.width, 1));
+    // Table solves column constraints at the origin before translating them.
+    // Match that exactly, including rounding in narrow terminals.
+    let columns: [Rect; 15] = Layout::horizontal(MODEL_TABLE_WIDTHS)
         .flex(Flex::Start)
         .spacing(1)
-        .areas(columns)
+        .areas(columns);
+    columns.map(|column| Rect::new(inner.x + column.x, inner.y, column.width, 1))
 }
 
 /// Visible range for the model table's single-line rows. Keep the widget offset
@@ -2653,22 +2760,11 @@ fn draw_plan(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
 }
 
 fn draw_provider_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
-    let area = frame.area();
-
+    let (popup_area, _, _) =
+        selection_popup(app, InputMode::ProviderPopup, frame.area()).expect("selection popup mode");
+    let popup_width = popup_area.width;
+    let popup_height = popup_area.height;
     let filtered = app.provider_filtered_indices();
-
-    let max_name_len = app.providers.iter().map(|p| p.len()).max().unwrap_or(10);
-    // Width must also fit the search box / hint line.
-    let popup_width = (max_name_len as u16 + 10)
-        .max(28)
-        .min(area.width.saturating_sub(4));
-    // +2 borders, +1 search row. List body shows at most all matches.
-    let list_rows = (filtered.len().max(1) as u16).min(area.height.saturating_sub(6));
-    let popup_height = (list_rows + 3).min(area.height.saturating_sub(4));
-
-    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
-    let popup_area = Rect::new(x, y, popup_width, popup_height);
 
     frame.render_widget(Clear, popup_area);
 
@@ -2770,6 +2866,7 @@ fn draw_provider_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .title_top(Line::from(" [Esc] ").right_aligned())
         .border_style(Style::default().fg(tc.accent_secondary))
         .style(Style::default().bg(tc.bg))
         .title(title)
@@ -2812,20 +2909,9 @@ fn draw_provider_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 }
 
 fn draw_use_case_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
-    let area = frame.area();
-
-    let max_name_len = app
-        .use_cases
-        .iter()
-        .map(|uc| uc.label().len())
-        .max()
-        .unwrap_or(10);
-    let popup_width = (max_name_len as u16 + 10).min(area.width.saturating_sub(4));
-    let popup_height = (app.use_cases.len() as u16 + 2).min(area.height.saturating_sub(4));
-
-    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
-    let popup_area = Rect::new(x, y, popup_width, popup_height);
+    let (popup_area, _, _) =
+        selection_popup(app, InputMode::UseCasePopup, frame.area()).expect("selection popup mode");
+    let popup_height = popup_area.height;
 
     frame.render_widget(Clear, popup_area);
 
@@ -2882,6 +2968,7 @@ fn draw_use_case_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .title_top(Line::from(" [Esc] ").right_aligned())
         .border_style(Style::default().fg(tc.accent_secondary))
         .style(Style::default().bg(tc.bg))
         .title(title)
@@ -2896,20 +2983,9 @@ fn draw_use_case_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 }
 
 fn draw_capability_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
-    let area = frame.area();
-
-    let max_name_len = app
-        .capabilities
-        .iter()
-        .map(|c| c.label().len())
-        .max()
-        .unwrap_or(10);
-    let popup_width = (max_name_len as u16 + 10).min(area.width.saturating_sub(4));
-    let popup_height = (app.capabilities.len() as u16 + 2).min(area.height.saturating_sub(4));
-
-    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
-    let popup_area = Rect::new(x, y, popup_width, popup_height);
+    let (popup_area, _, _) = selection_popup(app, InputMode::CapabilityPopup, frame.area())
+        .expect("selection popup mode");
+    let popup_height = popup_area.height;
 
     frame.render_widget(Clear, popup_area);
 
@@ -2966,6 +3042,7 @@ fn draw_capability_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .title_top(Line::from(" [Esc] ").right_aligned())
         .border_style(Style::default().fg(tc.accent_secondary))
         .style(Style::default().bg(tc.bg))
         .title(title)
@@ -2984,9 +3061,7 @@ fn draw_download_provider_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) 
     let popup_width = 44.min(area.width.saturating_sub(4));
     let popup_height = 8.min(area.height.saturating_sub(4));
 
-    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
-    let popup_area = Rect::new(x, y, popup_width, popup_height);
+    let popup_area = centered_popup(area, popup_width, popup_height);
 
     frame.render_widget(Clear, popup_area);
 
@@ -3026,6 +3101,7 @@ fn draw_download_provider_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) 
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .title_top(Line::from(" [Esc] ").right_aligned())
         .border_style(Style::default().fg(tc.accent_secondary))
         .style(Style::default().bg(tc.bg))
         .title(" Download With ")
@@ -3039,9 +3115,15 @@ fn draw_download_provider_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) 
     frame.render_widget(paragraph, popup_area);
 }
 
-fn status_keys_and_mode(app: &App) -> (String, String) {
+pub(crate) fn status_keys_and_mode(app: &App) -> (String, String) {
     match app.input_mode {
         InputMode::Normal => {
+            if app.bench_confirm_quit {
+                return (
+                    " q:stop benchmark  Esc:keep running".to_string(),
+                    "CONFIRM EXIT".to_string(),
+                );
+            }
             if app.show_bench {
                 let keys = match app.bench_view_mode {
                     BenchViewMode::Results => {
@@ -3106,8 +3188,8 @@ fn status_keys_and_mode(app: &App) -> (String, String) {
         }
         InputMode::Select => {
             let header_names = [
-                "", "Inst", "Model", "Provider", "Params", "Score", "tok/s*", "Quant", "Mode",
-                "Mem %", "Ctx", "Date", "Fit", "Use Case",
+                "", "Inst", "Model", "Provider", "Params", "Score", "tok/s*", "Quant", "Disk",
+                "Mode", "Mem %", "Ctx", "Date", "Fit", "Use Case",
             ];
             let col_name = header_names.get(app.select_column).unwrap_or(&"");
             (
@@ -3125,7 +3207,8 @@ fn status_keys_and_mode(app: &App) -> (String, String) {
             "PLAN".to_string(),
         ),
         InputMode::ProviderPopup => (
-            "  ↑↓:navigate (+Shift:speed up)  Space:toggle  a:all/none  Esc:close".to_string(),
+            "  ↑↓:navigate (+Shift:speed up)  Space:toggle  Ctrl-A:all  Ctrl-N:none  Esc:close"
+                .to_string(),
             "PROVIDERS".to_string(),
         ),
         InputMode::UseCasePopup => (
@@ -3172,6 +3255,14 @@ fn status_keys_and_mode(app: &App) -> (String, String) {
             "  Tab/jk:field  type:edit  Enter:apply  Ctrl-R:reset  Esc:close".to_string(),
             "ADV CONFIG".to_string(),
         ),
+        InputMode::DownloadManager if app.dm_confirm_delete => (
+            " y:delete  n:cancel".to_string(),
+            "CONFIRM DELETE".to_string(),
+        ),
+        InputMode::DownloadManager if app.dm_editing_dir => (
+            " Enter:apply  Ctrl-U:clear  Esc:cancel".to_string(),
+            "EDIT DIRECTORY".to_string(),
+        ),
         InputMode::DownloadManager => (
             "  Tab:section  jk:navigate  x:delete  e:edit dir  D/Esc:close".to_string(),
             "DOWNLOADS".to_string(),
@@ -3180,6 +3271,10 @@ fn status_keys_and_mode(app: &App) -> (String, String) {
             "  Tab/jk:nav  type:range  Space:toggle  Enter:apply  Ctrl-U:clear  Esc:close"
                 .to_string(),
             "FILTER".to_string(),
+        ),
+        InputMode::Benchmarks if app.bench_hw_picker_open => (
+            " ↑↓:choose  Enter:select  Esc:cancel".to_string(),
+            "HARDWARE".to_string(),
         ),
         InputMode::Benchmarks => (
             if app.bench_search_active {
@@ -3193,10 +3288,40 @@ fn status_keys_and_mode(app: &App) -> (String, String) {
             "COMMUNITY LEADERBOARD".to_string(),
         ),
         InputMode::BenchOffer => (
-            " Enter:run  Space:share toggle  Esc:skip".to_string(),
+            match app.bench_offer_state {
+                BenchOfferState::Offer => " Enter:run  Space:share toggle  Esc:skip",
+                BenchOfferState::Running => " Esc:continue in background",
+                _ => " Enter:continue  Esc:close",
+            }
+            .to_string(),
             "BENCHMARK".to_string(),
         ),
     }
+}
+
+pub(crate) fn status_progress_text(app: &App) -> Option<String> {
+    app.pull_status
+        .as_ref()
+        .map(|status| match app.pull_percent {
+            Some(pct) => format!(" {} [{:.0}%] ", status, pct),
+            None => format!(" {} ", status),
+        })
+}
+
+pub(crate) fn status_key_area(app: &App, area: Rect) -> Rect {
+    let rows: [Rect; 2] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+    let mut keys = rows[1];
+    if let Some(text) = status_progress_text(app) {
+        keys = Layout::horizontal([
+            Constraint::Min(20),
+            Constraint::Length(text.len() as u16 + 2),
+        ])
+        .areas::<2>(keys)[0];
+    }
+    let prefix = UnicodeWidthStr::width(status_keys_and_mode(app).1.as_str()) as u16 + 2;
+    let skip = prefix.min(keys.width);
+    Rect::new(keys.x + skip, keys.y, keys.width - skip, keys.height)
 }
 
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
@@ -3241,13 +3366,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     frame.render_widget(Paragraph::new(model_line), rows[0]);
 
     // Row 1: keybindings (with download progress if active)
-    if let Some(status) = &app.pull_status {
-        let progress_text = if let Some(pct) = app.pull_percent {
-            format!(" {} [{:.0}%] ", status, pct)
-        } else {
-            format!(" {} ", status)
-        };
-
+    if let Some(progress_text) = status_progress_text(app) {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -3292,15 +3411,9 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
 }
 
 fn draw_quant_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
-    let area = frame.area();
-
-    let max_name_len = app.quants.iter().map(|q| q.len()).max().unwrap_or(10);
-    let popup_width = (max_name_len as u16 + 10).min(area.width.saturating_sub(4));
-    let popup_height = (app.quants.len() as u16 + 2).min(area.height.saturating_sub(4));
-
-    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
-    let popup_area = Rect::new(x, y, popup_width, popup_height);
+    let (popup_area, _, _) =
+        selection_popup(app, InputMode::QuantPopup, frame.area()).expect("selection popup mode");
+    let popup_height = popup_area.height;
 
     frame.render_widget(Clear, popup_area);
 
@@ -3350,6 +3463,7 @@ fn draw_quant_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .title_top(Line::from(" [Esc] ").right_aligned())
         .border_style(Style::default().fg(tc.accent_secondary))
         .style(Style::default().bg(tc.bg))
         .title(title)
@@ -3364,15 +3478,9 @@ fn draw_quant_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 }
 
 fn draw_run_mode_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
-    let area = frame.area();
-
-    let max_name_len = app.run_modes.iter().map(|m| m.len()).max().unwrap_or(10);
-    let popup_width = (max_name_len as u16 + 10).min(area.width.saturating_sub(4));
-    let popup_height = (app.run_modes.len() as u16 + 2).min(area.height.saturating_sub(4));
-
-    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
-    let popup_area = Rect::new(x, y, popup_width, popup_height);
+    let (popup_area, _, _) =
+        selection_popup(app, InputMode::RunModePopup, frame.area()).expect("selection popup mode");
+    let popup_height = popup_area.height;
 
     frame.render_widget(Clear, popup_area);
 
@@ -3426,6 +3534,7 @@ fn draw_run_mode_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .title_top(Line::from(" [Esc] ").right_aligned())
         .border_style(Style::default().fg(tc.accent_secondary))
         .style(Style::default().bg(tc.bg))
         .title(title)
@@ -3440,20 +3549,9 @@ fn draw_run_mode_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 }
 
 fn draw_params_bucket_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
-    let area = frame.area();
-
-    let max_name_len = app
-        .params_buckets
-        .iter()
-        .map(|b| b.len())
-        .max()
-        .unwrap_or(10);
-    let popup_width = (max_name_len as u16 + 10).min(area.width.saturating_sub(4));
-    let popup_height = (app.params_buckets.len() as u16 + 2).min(area.height.saturating_sub(4));
-
-    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
-    let popup_area = Rect::new(x, y, popup_width, popup_height);
+    let (popup_area, _, _) = selection_popup(app, InputMode::ParamsBucketPopup, frame.area())
+        .expect("selection popup mode");
+    let popup_height = popup_area.height;
 
     frame.render_widget(Clear, popup_area);
 
@@ -3507,6 +3605,7 @@ fn draw_params_bucket_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .title_top(Line::from(" [Esc] ").right_aligned())
         .border_style(Style::default().fg(tc.accent_secondary))
         .style(Style::default().bg(tc.bg))
         .title(title)
@@ -3520,17 +3619,7 @@ fn draw_params_bucket_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     frame.render_widget(paragraph, popup_area);
 }
 
-fn draw_bench_offer_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
-    let area = frame.area();
-
-    let popup_width = 64.min(area.width.saturating_sub(4));
-    let popup_height = 14.min(area.height.saturating_sub(4));
-    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
-    let popup_area = Rect::new(x, y, popup_width, popup_height);
-
-    frame.render_widget(Clear, popup_area);
-
+pub(crate) fn bench_offer_lines(app: &App, tc: &ThemeColors) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = vec![
         Line::from(""),
         Line::from(vec![
@@ -3667,8 +3756,23 @@ fn draw_bench_offer_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
         }
     }
 
+    lines
+}
+
+fn draw_bench_offer_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
+    let area = frame.area();
+
+    let popup_width = 64.min(area.width.saturating_sub(4));
+    let popup_height = 14.min(area.height.saturating_sub(4));
+    let popup_area = centered_popup(area, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let lines = bench_offer_lines(app, tc);
+
     let block = Block::default()
         .borders(Borders::ALL)
+        .title_top(Line::from(" [Esc] ").right_aligned())
         .border_style(Style::default().fg(tc.border))
         .title(Span::styled(
             " Benchmark this model ",
@@ -3684,19 +3788,17 @@ fn draw_help_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     let area = frame.area();
 
     let popup_width = 52.min(area.width.saturating_sub(4));
-    let popup_height = (area.height - 4).min(32);
+    let popup_height = area.height.saturating_sub(4).min(32);
 
-    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
-    let popup_area = Rect::new(x, y, popup_width, popup_height);
+    let popup_area = centered_popup(area, popup_width, popup_height);
 
     frame.render_widget(Clear, popup_area);
 
     // Entries: ("key", "description") — empty key = blank line, key without leading spaces = section header
     let help_entries: Vec<(&str, &str)> = vec![
         ("Navigation", ""),
-        ("  Mouse wheel", "Move selection (Normal mode)"),
-        ("  Left click", "Model row / header (Normal mode)"),
+        ("  Mouse wheel", "Scroll the hovered list / view"),
+        ("  Left click", "Controls, hotkeys, rows and fields"),
         ("  ↑ / k", "Move up"),
         ("  ↓ / j", "Move down"),
         ("  Enter", "Toggle detail view"),
@@ -3783,6 +3885,7 @@ fn draw_help_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .title_top(Line::from(" [Esc] ").right_aligned())
         .border_style(Style::default().fg(tc.accent_secondary))
         .title(" Key Bindings ")
         .title_style(
@@ -3796,15 +3899,9 @@ fn draw_help_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 }
 
 fn draw_runtime_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
-    let area = frame.area();
-
-    let max_name_len = app.runtimes.iter().map(|r| r.len()).max().unwrap_or(10);
-    let popup_width = (max_name_len as u16 + 10).min(area.width.saturating_sub(4));
-    let popup_height = (app.runtimes.len() as u16 + 2).min(area.height.saturating_sub(4));
-
-    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
-    let popup_area = Rect::new(x, y, popup_width, popup_height);
+    let (popup_area, _, _) =
+        selection_popup(app, InputMode::RuntimePopup, frame.area()).expect("selection popup mode");
+    let popup_height = popup_area.height;
 
     frame.render_widget(Clear, popup_area);
 
@@ -3858,6 +3955,7 @@ fn draw_runtime_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .title_top(Line::from(" [Esc] ").right_aligned())
         .border_style(Style::default().fg(tc.accent_secondary))
         .title(title)
         .title_style(
@@ -3871,15 +3969,9 @@ fn draw_runtime_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 }
 
 fn draw_license_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
-    let area = frame.area();
-
-    let max_name_len = app.licenses.iter().map(|l| l.len()).max().unwrap_or(10);
-    let popup_width = (max_name_len as u16 + 10).min(area.width.saturating_sub(4));
-    let popup_height = (app.licenses.len() as u16 + 2).min(area.height.saturating_sub(4));
-
-    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
-    let popup_area = Rect::new(x, y, popup_width, popup_height);
+    let (popup_area, _, _) =
+        selection_popup(app, InputMode::LicensePopup, frame.area()).expect("selection popup mode");
+    let popup_height = popup_area.height;
 
     frame.render_widget(Clear, popup_area);
 
@@ -3933,6 +4025,7 @@ fn draw_license_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .title_top(Line::from(" [Esc] ").right_aligned())
         .border_style(Style::default().fg(tc.accent_secondary))
         .style(Style::default().bg(tc.bg))
         .title(title)
@@ -3951,14 +4044,13 @@ fn draw_simulation_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 
     let popup_width = 48u16.min(area.width.saturating_sub(4));
     let popup_height = 14u16.min(area.height.saturating_sub(4));
-    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
-    let popup_area = Rect::new(x, y, popup_width, popup_height);
+    let popup_area = centered_popup(area, popup_width, popup_height);
 
     frame.render_widget(Clear, popup_area);
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .title_top(Line::from(" [Esc] ").right_aligned())
         .border_style(Style::default().fg(tc.accent_secondary))
         .style(Style::default().bg(tc.bg))
         .title(" Hardware Simulation ")
@@ -4066,14 +4158,13 @@ fn draw_advanced_config_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 
     let popup_width = 52u16.min(area.width.saturating_sub(4));
     let popup_height = 17u16.min(area.height.saturating_sub(4));
-    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
-    let popup_area = Rect::new(x, y, popup_width, popup_height);
+    let popup_area = centered_popup(area, popup_width, popup_height);
 
     frame.render_widget(Clear, popup_area);
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .title_top(Line::from(" [Esc] ").right_aligned())
         .border_style(Style::default().fg(tc.accent_secondary))
         .style(Style::default().bg(tc.bg))
         .title(" Advanced Configuration ")
@@ -4189,15 +4280,19 @@ fn draw_advanced_config_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 // Download Manager view
 // ---------------------------------------------------------------------------
 
-fn draw_downloads(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
-    let chunks = Layout::default()
+pub(crate) fn download_manager_layout(area: Rect) -> [Rect; 3] {
+    Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(5), // Active download
             Constraint::Length(3), // Config
             Constraint::Min(6),    // History
         ])
-        .split(area);
+        .areas(area)
+}
+
+fn draw_downloads(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
+    let chunks = download_manager_layout(area);
 
     draw_dm_active(frame, app, chunks[0], tc);
     draw_dm_config(frame, app, chunks[1], tc);
@@ -4205,11 +4300,7 @@ fn draw_downloads(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
 
     // Show delete confirmation overlay
     if app.dm_confirm_delete {
-        let popup_width = 50u16.min(area.width.saturating_sub(4));
-        let popup_height = 5u16;
-        let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
-        let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
-        let popup_area = Rect::new(x, y, popup_width, popup_height);
+        let popup_area = centered_popup(area, 50, 5);
         frame.render_widget(Clear, popup_area);
 
         let model_name = app
@@ -4387,6 +4478,11 @@ fn draw_dm_history(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         .iter()
         .rev()
         .enumerate()
+        .skip(
+            app.dm_history_cursor
+                .saturating_sub((area.height.saturating_sub(3) as usize).saturating_sub(1)),
+        )
+        .take(area.height.saturating_sub(3) as usize)
         .map(|(display_idx, record)| {
             let (status_text, status_color) = match &record.result {
                 DownloadResult::Success => ("✓ Done", tc.good),
@@ -4755,14 +4851,13 @@ fn draw_bench_hw_picker(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     // Wide enough for "<label> (NNN benchmarks)" plus marker and check.
     let popup_width = 52u16.min(area.width.saturating_sub(4));
 
-    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
-    let popup_area = Rect::new(x, y, popup_width, popup_height);
+    let popup_area = centered_popup(area, popup_width, popup_height);
 
     frame.render_widget(Clear, popup_area);
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .title_top(Line::from(" [Esc] ").right_aligned())
         .border_style(Style::default().fg(tc.accent))
         .title(" Select Hardware ")
         .title_style(Style::default().fg(tc.accent).add_modifier(Modifier::BOLD));
@@ -4777,7 +4872,8 @@ fn draw_bench_hw_picker(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 
     // Scrolling: keep cursor in view
     let scroll = if app.bench_hw_picker_cursor >= inner_height {
-        app.bench_hw_picker_cursor.saturating_sub(inner_height - 1)
+        app.bench_hw_picker_cursor
+            .saturating_sub(inner_height.saturating_sub(1))
     } else {
         0
     };
@@ -4828,14 +4924,13 @@ fn draw_filter_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     let area = frame.area();
     let popup_width = 56u16.min(area.width.saturating_sub(4));
     let popup_height = 21u16.min(area.height.saturating_sub(4));
-    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
-    let popup_area = Rect::new(x, y, popup_width, popup_height);
+    let popup_area = centered_popup(area, popup_width, popup_height);
 
     frame.render_widget(Clear, popup_area);
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .title_top(Line::from(" [Esc] ").right_aligned())
         .border_style(Style::default().fg(tc.accent_secondary))
         .style(Style::default().bg(tc.bg))
         .title(" Filter [F] ")
