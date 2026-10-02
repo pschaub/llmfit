@@ -1,6 +1,6 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Flex, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
@@ -803,21 +803,36 @@ fn marquee_text(text: &str, window_chars: usize, tick: u64) -> String {
     ring[start..start + window_chars].iter().collect()
 }
 
-fn model_col_text_width(area: Rect, widths: [Constraint; 14]) -> usize {
-    let inner = Rect {
-        x: 0,
-        y: 0,
-        width: area.width.saturating_sub(2), // account for table borders
-        height: 1,
-    };
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(widths)
-        .split(inner);
+const MODEL_TABLE_WIDTHS: [Constraint; 15] = [
+    Constraint::Length(2),                         // indicator
+    Constraint::Length(5),                         // installed / pull %
+    Constraint::Min(20),                           // model name
+    Constraint::Length(PROVIDER_COL_WIDTH as u16), // provider
+    Constraint::Length(8),                         // params
+    Constraint::Length(8),                         // score
+    Constraint::Length(8),                         // tok/s
+    Constraint::Length(10),                        // quant
+    Constraint::Length(6),                         // disk
+    Constraint::Length(7),                         // mode
+    Constraint::Length(7),                         // mem %
+    Constraint::Length(10),                        // ctx
+    Constraint::Length(8),                         // date
+    Constraint::Length(10),                        // fit
+    Constraint::Min(10),                           // use case
+];
 
-    cols.get(2)
-        .map(|r| r.width.saturating_sub(1) as usize)
-        .unwrap_or(0)
+/// Match Table's border, highlight symbol, and default column spacing.
+pub(crate) fn model_table_columns(area: Rect, has_selection: bool) -> [Rect; 15] {
+    let inner = area.inner(Margin::new(1, 1));
+    let [_, columns] = Layout::horizontal([
+        Constraint::Length(if has_selection { 2 } else { 0 }),
+        Constraint::Fill(0),
+    ])
+    .areas(Rect::new(inner.x, inner.y, inner.width, 1));
+    Layout::horizontal(MODEL_TABLE_WIDTHS)
+        .flex(Flex::Start)
+        .spacing(1)
+        .areas(columns)
 }
 
 /// Visible range for the model table's single-line rows. Keep the widget offset
@@ -881,25 +896,6 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     let header = Row::new(header_cells).height(1);
 
     let visual_range = app.visual_range();
-    let widths = [
-        Constraint::Length(2),  // indicator
-        Constraint::Length(5),  // installed / pull %
-        Constraint::Min(20),    // model name
-        Constraint::Length(12), // provider
-        Constraint::Length(8),  // params
-        Constraint::Length(6),  // score
-        Constraint::Length(6),  // tok/s
-        Constraint::Length(10), // quant (AWQ-4bit, GPTQ-Int4, GPTQ-Int8)
-        Constraint::Length(7),  // mode
-        Constraint::Length(6),  // mem %
-        Constraint::Length(10), // ctx ("262k→14k" when memory-constrained)
-        Constraint::Length(8),  // date (YYYY-MM)
-        Constraint::Length(10), // fit
-        Constraint::Min(10),    // use case
-    ];
-
-    let model_col_chars = model_col_text_width(area, widths);
-
     // Two border lines and one header line leave the rest for model rows.
     let viewport = model_table_viewport(
         app.filtered_fits.len(),
@@ -907,6 +903,8 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         app.table_state.offset(),
         usize::from(area.height.saturating_sub(3)),
     );
+    let columns = model_table_columns(area, viewport.contains(&app.selected_row));
+    let model_col_chars = usize::from(columns[2].width.saturating_sub(1));
     let rows: Vec<Row> = app.filtered_fits[viewport.clone()]
         .iter()
         .enumerate()
@@ -1068,31 +1066,13 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         })
         .collect();
 
-    let widths = [
-        Constraint::Length(2),                         // indicator
-        Constraint::Length(5),                         // installed / pull %
-        Constraint::Min(20),                           // model name
-        Constraint::Length(PROVIDER_COL_WIDTH as u16), // provider
-        Constraint::Length(8),                         // params
-        Constraint::Length(8),                         // score
-        Constraint::Length(8),                         // tok/s
-        Constraint::Length(10),                        // quant (AWQ-4bit, GPTQ-Int4, GPTQ-Int8)
-        Constraint::Length(6),                         // disk
-        Constraint::Length(7),                         // mode
-        Constraint::Length(7),                         // mem %
-        Constraint::Length(10),                        // ctx ("262k→14k" when memory-constrained)
-        Constraint::Length(8),                         // date (YYYY-MM)
-        Constraint::Length(10),                        // fit
-        Constraint::Min(10),                           // use case
-    ];
-
     let count_text = format!(
         " Models ({}/{}) ",
         app.filtered_fits.len(),
         app.all_fits.len()
     );
 
-    let table = Table::new(rows, widths)
+    let table = Table::new(rows, MODEL_TABLE_WIDTHS)
         .header(header)
         .block(
             Block::default()
@@ -3715,6 +3695,8 @@ fn draw_help_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     // Entries: ("key", "description") — empty key = blank line, key without leading spaces = section header
     let help_entries: Vec<(&str, &str)> = vec![
         ("Navigation", ""),
+        ("  Mouse wheel", "Move selection (Normal mode)"),
+        ("  Left click", "Model row / header (Normal mode)"),
         ("  ↑ / k", "Move up"),
         ("  ↓ / j", "Move down"),
         ("  Enter", "Toggle detail view"),

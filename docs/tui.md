@@ -49,6 +49,13 @@ Launches the interactive terminal UI. Your system specs (CPU, RAM, GPU name, VRA
 
 ### Vim-like modes
 
+In Normal mode, the mouse wheel over the model table moves the selection up or
+down. Left-click a model row to select it, then press `Enter` to open its details.
+Left-click a column header to trigger the same action as that column in Select
+mode (listed below). Mouse input does not affect the model table while a popup,
+another view, or another input mode is open. Modified clicks, dragging, and
+double-click actions are not supported.
+
 The TUI uses Vim-inspired modes shown in the bottom-left status bar. The current mode determines which keys are active.
 
 #### Normal mode

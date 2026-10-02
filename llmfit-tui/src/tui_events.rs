@@ -1,4 +1,8 @@
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
+use ratatui::layout::{Position, Rect};
 use std::time::Duration;
 
 use crate::tui_app::{App, InputMode};
@@ -31,7 +35,7 @@ pub fn update_model_viewport(app: &mut App, terminal_area: ratatui::layout::Rect
 /// Poll for and handle events. Returns true if an event was processed.
 pub fn handle_events(app: &mut App) -> std::io::Result<bool> {
     let processed = handle_pending_events(app)?;
-    // Refresh after keys, resize events, and background-worker state changes.
+    // Refresh after input, resize events, and background-worker state changes.
     let (width, height) = crossterm::terminal::size()?;
     update_model_viewport(app, ratatui::layout::Rect::new(0, 0, width, height));
     Ok(processed)
@@ -44,9 +48,15 @@ fn handle_pending_events(app: &mut App) -> std::io::Result<bool> {
     app.tick_bench_offer();
     app.tick_bench_fetch();
 
-    if event::poll(Duration::from_millis(50))?
-        && let Event::Key(key) = event::read()?
-    {
+    if event::poll(Duration::from_millis(50))? {
+        let key = match event::read()? {
+            Event::Key(key) => key,
+            Event::Mouse(mouse) => {
+                let (width, height) = crossterm::terminal::size()?;
+                return Ok(handle_mouse(app, mouse, Rect::new(0, 0, width, height)));
+            }
+            _ => return Ok(false),
+        };
         // Only handle Press events (ignore Release on some platforms)
         if key.kind != KeyEventKind::Press {
             return Ok(false);
@@ -77,6 +87,65 @@ fn handle_pending_events(app: &mut App) -> std::io::Result<bool> {
         return Ok(true);
     }
     Ok(false)
+}
+
+fn handle_mouse(app: &mut App, mouse: MouseEvent, terminal_area: Rect) -> bool {
+    // Popups and alternate views must never change the table underneath them.
+    if app.input_mode != InputMode::Normal
+        || app.show_bench
+        || app.show_benchmarks
+        || app.show_downloads
+        || app.show_plan
+        || app.show_multi_compare
+        || app.show_compare
+        || app.show_detail
+        || app.bench_confirm_quit
+        || !mouse.modifiers.is_empty()
+    {
+        return false;
+    }
+
+    let table_area = crate::tui_ui::main_layout(terminal_area)[2];
+    let inner = table_area.inner(ratatui::layout::Margin::new(1, 1));
+    let position = Position::new(mouse.column, mouse.row);
+    if !inner.contains(position) {
+        return false;
+    }
+    let viewport = crate::tui_ui::model_table_viewport(
+        app.filtered_fits.len(),
+        app.selected_row,
+        app.table_state.offset(),
+        usize::from(table_area.height.saturating_sub(3)),
+    );
+    match mouse.kind {
+        MouseEventKind::ScrollUp => app.move_up(),
+        MouseEventKind::ScrollDown => app.move_down(),
+        MouseEventKind::Down(MouseButton::Left) if mouse.row == inner.y => {
+            let columns = crate::tui_ui::model_table_columns(
+                table_area,
+                viewport.contains(&app.selected_row),
+            );
+            let Some(column) = columns.iter().position(|area| area.contains(position)) else {
+                return false;
+            };
+            if column == 0 || column == 8 {
+                return false; // Indicator and disk size have no column action.
+            }
+            app.select_column = column;
+            app.activate_select_column_filter();
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            let row = viewport.start + usize::from(mouse.row - inner.y - 1);
+            if !viewport.contains(&row) {
+                return false;
+            }
+            app.selected_row = row;
+            app.confirm_download = false;
+            app.enqueue_capability_probes_for_visible(24);
+        }
+        _ => return false,
+    }
+    true
 }
 
 fn handle_normal_mode(app: &mut App, key: KeyEvent) {
@@ -852,6 +921,197 @@ mod tests {
 
     fn plain(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn mouse_selects_visible_rows_and_bounds_wheel_navigation() {
+        let mut app = plan_mode_app();
+        app.input_mode = InputMode::Normal;
+        app.show_plan = false;
+        app.filtered_fits = (0..app.all_fits.len().min(100)).rev().collect();
+        let count = app.filtered_fits.len();
+        assert!(count > 20);
+        app.selected_row = count - 1;
+        update_model_viewport(&mut app, Rect::new(0, 0, 160, 24));
+
+        // A resize between frames must not leave hit testing on the old offset.
+        let area = Rect::new(0, 0, 160, 20);
+        let table = crate::tui_ui::main_layout(area)[2];
+        let capacity = usize::from(table.height - 3);
+        let click = mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            table.x + 4,
+            table.y + 2,
+        );
+        app.confirm_download = true;
+        assert!(handle_mouse(&mut app, click, area));
+        assert_eq!(app.selected_row, count - capacity);
+        assert_eq!(
+            app.selected_fit().unwrap().model.name,
+            app.all_fits[app.filtered_fits[count - capacity]].model.name
+        );
+        assert!(!app.confirm_download);
+
+        app.selected_row = 0;
+        let up = mouse(MouseEventKind::ScrollUp, click.column, click.row);
+        let down = mouse(MouseEventKind::ScrollDown, click.column, click.row);
+        handle_mouse(&mut app, up, area);
+        assert_eq!(app.selected_row, 0);
+        handle_mouse(&mut app, down, area);
+        assert_eq!(app.selected_row, 1);
+        app.selected_row = count - 1;
+        handle_mouse(&mut app, down, area);
+        assert_eq!(app.selected_row, count - 1);
+
+        // Filtering can shrink the list while a previous scroll offset remains.
+        app.filtered_fits.truncate(2);
+        app.selected_row = 0;
+        assert!(handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                click.column,
+                click.row + 1
+            ),
+            area
+        ));
+        assert_eq!(app.selected_row, 1);
+        assert!(!handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                click.column,
+                click.row + 2
+            ),
+            area
+        ));
+        app.filtered_fits.clear();
+        app.selected_row = 0;
+        assert!(!handle_mouse(&mut app, click, area));
+        handle_mouse(&mut app, down, area);
+        handle_mouse(&mut app, up, area);
+        assert_eq!(app.selected_row, 0);
+    }
+
+    #[test]
+    fn mouse_headers_match_rendered_columns_with_and_without_selection() {
+        use llmfit_core::fit::SortColumn;
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut app = plan_mode_app();
+        app.input_mode = InputMode::Normal;
+        app.show_plan = false;
+        for width in [120, 220] {
+            for empty in [false, true] {
+                app.filtered_fits = if empty { Vec::new() } else { vec![0, 1] };
+                app.selected_row = 0;
+                app.sort_column = SortColumn::Score;
+                app.sort_ascending = false;
+                let area = Rect::new(0, 0, width, 24);
+                update_model_viewport(&mut app, area);
+                let mut terminal = Terminal::new(TestBackend::new(width, 24)).expect("terminal");
+                terminal
+                    .draw(|f| crate::tui_ui::draw(f, &mut app))
+                    .expect("frame");
+                let y = crate::tui_ui::main_layout(area)[2].y + 1;
+                let buffer = terminal.backend().buffer();
+                // Use the actual rendered label, independently of the hit-test helper.
+                let x = (0..width - 5)
+                    .find(|&x| {
+                        (x..x + 5)
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                            == "Score"
+                    })
+                    .expect("visible Score header");
+                assert!(handle_mouse(
+                    &mut app,
+                    mouse(MouseEventKind::Down(MouseButton::Left), x, y),
+                    area
+                ));
+                assert_eq!(app.sort_column, SortColumn::Score);
+                assert!(app.sort_ascending, "width={width}, empty={empty}");
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_ignores_overlays_borders_and_non_action_events() {
+        let mut app = plan_mode_app();
+        app.show_plan = false;
+        app.filtered_fits = vec![0, 1, 2];
+        app.selected_row = 0;
+        let area = Rect::new(0, 0, 160, 24);
+        let table = crate::tui_ui::main_layout(area)[2];
+        let click = mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            table.x + 4,
+            table.y + 3,
+        );
+        for mode in [
+            InputMode::HelpPopup,
+            InputMode::ProviderPopup,
+            InputMode::Search,
+            InputMode::Visual,
+            InputMode::Select,
+            InputMode::BenchOffer,
+        ] {
+            app.input_mode = mode;
+            assert!(!handle_mouse(&mut app, click, area));
+            assert!(!handle_mouse(
+                &mut app,
+                mouse(MouseEventKind::ScrollDown, click.column, click.row),
+                area
+            ));
+            assert_eq!(app.selected_row, 0);
+        }
+        app.input_mode = InputMode::Normal;
+        app.show_detail = true;
+        assert!(!handle_mouse(&mut app, click, area));
+        app.show_detail = false;
+        app.bench_confirm_quit = true;
+        assert!(!handle_mouse(&mut app, click, area));
+        app.bench_confirm_quit = false;
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Right),
+        ] {
+            assert!(!handle_mouse(
+                &mut app,
+                mouse(kind, click.column, click.row),
+                area
+            ));
+        }
+        assert!(!handle_mouse(
+            &mut app,
+            MouseEvent {
+                modifiers: KeyModifiers::CONTROL,
+                ..click
+            },
+            area
+        ));
+        for (x, y) in [
+            (table.x, click.row),
+            (table.right() - 1, click.row),
+            (click.column, table.y),
+            (click.column, table.bottom() - 1),
+            (0, 0),
+        ] {
+            assert!(!handle_mouse(&mut app, mouse(click.kind, x, y), area));
+        }
+        assert_eq!(app.selected_row, 0);
+        assert!(!handle_mouse(&mut app, click, Rect::new(0, 0, 1, 1)));
     }
 
     #[test]
